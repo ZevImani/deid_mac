@@ -13,6 +13,7 @@ from functools import lru_cache, partial
 import multiprocessing as mp
 from typing import List, Tuple, Set, Optional, Union
 import warnings
+import torch
 
 # Suppress warnings for cleaner output
 warnings.filterwarnings("ignore", category=FutureWarning)
@@ -99,12 +100,28 @@ class OptimizedRegexMasker:
 
 class OptimizedHuggingfaceMasker:
     """
-    Optimized Hugging Face masker with batch processing and model caching.
+    Optimized Hugging Face masker with Mac MPS compatibility.
     """
     
     def __init__(self, model_name="StanfordAIMI/stanford-deidentifier-only-i2b2", cache_dir=None, device=0, batch_size=32):
         self.model_name = model_name
         self.batch_size = batch_size
+        
+        # Determine the best device for Mac compatibility
+        if device >= 0:
+            if torch.backends.mps.is_available():
+                # For Mac M1/M2, use MPS but be cautious about unsupported operations
+                effective_device = "mps"
+                print(f"Using MPS (Metal Performance Shaders) for {model_name}")
+            elif torch.cuda.is_available():
+                effective_device = device
+                print(f"Using CUDA device {device} for {model_name}")
+            else:
+                effective_device = "cpu"
+                print(f"Using CPU for {model_name} (no GPU available)")
+        else:
+            effective_device = "cpu"
+            print(f"Using CPU for {model_name} (CPU explicitly requested)")
         
         # Use faster tokenizer settings
         self.tokenizer = AutoTokenizer.from_pretrained(
@@ -120,16 +137,26 @@ class OptimizedHuggingfaceMasker:
             torch_dtype='auto'  # Use automatic mixed precision when available
         )
         
-        effective_device = device if device >= 0 else -1
-        # Create pipeline without return_all_scores (not supported in some versions)
-        self.nlp = pipeline(
-            "ner", 
-            model=self.model, 
-            tokenizer=self.tokenizer, 
-            device=effective_device, 
-            aggregation_strategy="simple",
-            batch_size=self.batch_size  # Enable batching
-        )
+        # Create pipeline with Mac MPS compatibility
+        try:
+            self.nlp = pipeline(
+                "ner", 
+                model=self.model, 
+                tokenizer=self.tokenizer, 
+                device=effective_device, 
+                aggregation_strategy="simple",
+                batch_size=1 if effective_device == "mps" else self.batch_size  # Use batch_size=1 for MPS to avoid issues
+            )
+        except Exception as e:
+            print(f"Warning: Failed to initialize pipeline with {effective_device}, falling back to CPU: {e}")
+            self.nlp = pipeline(
+                "ner", 
+                model=self.model, 
+                tokenizer=self.tokenizer, 
+                device="cpu", 
+                aggregation_strategy="simple",
+                batch_size=self.batch_size
+            )
 
     def get_entity_spans(self, text: str, entity_types: Optional[Union[str, List[str]]] = None) -> List[Tuple[int, int, str]]:
         if not text.strip():
@@ -327,7 +354,8 @@ class OptimizedDeidentifier:
     def __init__(self, maskers: List, default_mask: str = '[REDACTED]', n_jobs: int = None):
         self.maskers = maskers
         self.default_mask = default_mask
-        self.n_jobs = n_jobs or min(mp.cpu_count(), 4)  # Limit to 4 to avoid overwhelming system
+        # For Mac MPS compatibility, reduce parallel jobs to avoid memory issues
+        self.n_jobs = n_jobs or min(mp.cpu_count() // 2, 2)  # More conservative for Mac
         
         # Pre-compile mask replacement pattern
         self._mask_pattern = re.compile(r'(' + re.escape(default_mask) + r')(?:\s*\1)+')
@@ -386,16 +414,16 @@ class OptimizedDeidentifier:
         if len(texts) == 1:
             return [self._process_single_text(texts[0], entity_types)]
         
-        # Use parallel processing for batch operations
+        # For Mac MPS compatibility, prefer sequential processing for smaller batches
+        if len(texts) < 5:
+            return [self._process_single_text(text, entity_types) for text in texts]
+        
+        # Use parallel processing for larger batches
         process_func = partial(self._process_single_text, entity_types=entity_types)
         
-        # Choose between threading and multiprocessing based on workload
-        if len(texts) < 10:  # Small batch - use threading
-            with ThreadPoolExecutor(max_workers=min(self.n_jobs, len(texts))) as executor:
-                return list(executor.map(process_func, texts))
-        else:  # Large batch - use multiprocessing
-            with ProcessPoolExecutor(max_workers=min(self.n_jobs, len(texts))) as executor:
-                return list(executor.map(process_func, texts))
+        # Use threading for better compatibility with Mac MPS
+        with ThreadPoolExecutor(max_workers=min(self.n_jobs, len(texts))) as executor:
+            return list(executor.map(process_func, texts))
 
     def deidentify_csv(self, input_csv_path: str, output_csv_path: str, column_name: str, 
                       entity_types: Optional[List[str]] = None, chunk_size: int = 1000):
